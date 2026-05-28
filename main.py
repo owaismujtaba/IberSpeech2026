@@ -9,9 +9,10 @@ from data.dataset import EEGEpochsDataset
 from models.model_factory import create_model
 from engine.trainer import train_one_epoch, evaluate
 import mne
+import pdb
 
 def main():
-    # 1. Setup config
+    # 1. Setup configpip
     args = get_args()
     config = load_config(args.config)
     config = merge_args_with_config(args, config)
@@ -33,13 +34,14 @@ def main():
         
         for raw in raws:
             # Basic preprocessing
+            '''
             raw = preprocess_raw(
                 raw,
                 l_freq=config['preprocessing']['l_freq'],
                 h_freq=config['preprocessing']['h_freq'],
                 resample_freq=config['preprocessing']['resample_freq']
             )
-            
+            '''
             events, event_id = extract_events(raw)
             if len(events) == 0:
                 print(f"No events found for subject {subject}.")
@@ -53,6 +55,7 @@ def main():
                 tmax=config['preprocessing']['tmax'],
                 baseline=tuple(config['preprocessing']['baseline']) if config['preprocessing']['baseline'] else None
             )
+            pdb.set_trace()
             all_epochs.append(epochs)
 
     if len(all_epochs) == 0:
