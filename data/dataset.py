@@ -1,6 +1,35 @@
 import torch
 from torch.utils.data import Dataset
 
+def load_syllable_epochs(config):
+    """
+    Loads all syllable epochs from the processed folder and concatenates them.
+    Returns a single MNE Epochs object containing all data.
+    """
+    import mne
+    import os
+    from pathlib import Path
+
+    dir = Path(os.getcwd(), "processed", "syllable")
+    if not dir.exists():
+        raise ValueError(f"Directory {dir} does not exist. Please run create_syllable_epochs first.")
+
+    epoch_files = list(dir.glob("*.fif"))
+    if len(epoch_files) == 0:
+        raise ValueError(f"No .fif files found in {dir}. Please check your processed data.")
+
+    all_epochs = []
+    for epoch_file in epoch_files:
+        print(f"Loading {epoch_file}...")
+        epochs = mne.read_epochs(epoch_file, verbose=False)
+        all_epochs.append(epochs)
+
+    return all_epochs
+    
+
+
+
+
 class EEGEpochsDataset(Dataset):
     def __init__(self, epochs, transform=None):
         """

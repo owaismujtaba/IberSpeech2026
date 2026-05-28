@@ -1,24 +1,25 @@
 import mne
 
-def preprocess_raw(raw, l_freq=1.0, h_freq=100.0, resample_freq=250):
+def preprocess_raw(raw, l_freq=1.0, h_freq=100.0, resample_freq=None):
     """
     Applies basic preprocessing: filtering, re-referencing, and resampling.
     """
-    # Set EEG montage if available (optional, depends on dataset)
-    # raw.set_montage('standard_1020', match_case=False)
+    print(f"Preprocessing raw data")
+    # Drop inconsistent channels and EOGs
+    raw.drop_channels(['EOG1', 'EOG2', 'TP9', 'TP10'], on_missing='ignore')
+    
+    # Set standard EEG montage so Interpolated models can calculate 3D spatial locations
+    raw.set_montage('standard_1020', match_case=False, on_missing='ignore')
 
     # Bandpass filter
-    raw.filter(l_freq=l_freq, h_freq=h_freq, fir_design='firwin', verbose=False)
+    #raw.filter(l_freq=l_freq, h_freq=h_freq, fir_design='firwin', verbose=False)
     
     # Notch filter for power line noise (assuming 50Hz for Europe/Spain)
-    raw.notch_filter(freqs=50, verbose=False)
+    #raw.notch_filter(freqs=50, verbose=False)
 
     # Re-reference to average
     raw.set_eeg_reference('average', projection=False, verbose=False)
 
-    # Resample
-    if resample_freq is not None:
-        raw.resample(resample_freq, npad="auto", verbose=False)
 
     return raw
 

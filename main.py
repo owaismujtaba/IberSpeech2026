@@ -8,6 +8,9 @@ from data.preprocess import preprocess_raw, epoch_data
 from data.dataset import EEGEpochsDataset
 from models.model_factory import create_model
 from engine.trainer import train_one_epoch, evaluate
+from utils.save_data import save_epochs
+from data.create_syllable_epochs import create_syllable_epochs
+from data.dataset import load_syllable_epochs
 import mne
 import pdb
 
@@ -20,50 +23,12 @@ def main():
     device = torch.device(config['training']['device'] if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # 2. Load and Preprocess Data
-    print("Loading datasets...")
-    all_epochs = []
-    for subject in config['dataset']['subjects']:
-        print(f"Processing subject {subject}...")
-        raws = load_subject_data(
-            bids_root=config['dataset']['bids_root'],
-            subject=subject,
-            task=config['dataset']['task'],
-            datatype=config['dataset']['datatype']
-        )
-        
-        for raw in raws:
-            # Basic preprocessing
-            '''
-            raw = preprocess_raw(
-                raw,
-                l_freq=config['preprocessing']['l_freq'],
-                h_freq=config['preprocessing']['h_freq'],
-                resample_freq=config['preprocessing']['resample_freq']
-            )
-            '''
-            events, event_id = extract_events(raw)
-            if len(events) == 0:
-                print(f"No events found for subject {subject}.")
-                continue
-                
-            epochs = epoch_data(
-                raw, 
-                events, 
-                event_id,
-                tmin=config['preprocessing']['tmin'],
-                tmax=config['preprocessing']['tmax'],
-                baseline=tuple(config['preprocessing']['baseline']) if config['preprocessing']['baseline'] else None
-            )
-            pdb.set_trace()
-            all_epochs.append(epochs)
-
-    if len(all_epochs) == 0:
-        raise ValueError("No epochs were loaded. Please check your BIDS dataset and events.")
-        
-    # Concatenate all epochs
-    mne.set_log_level('WARNING')
-    combined_epochs = mne.concatenate_epochs(all_epochs)
+    if config['workflow']['create_syllable_epochs']:
+        create_syllable_epochs()
+    else:
+        print("Loading syllable epochs...")
+        all_epochs = load_syllable_epochs(config)
+        combined_epochs = mne.concatenate_epochs(all_epochs)
     
     # Update config based on loaded data
     config['model']['in_chans'] = len(combined_epochs.ch_names)
