@@ -1,0 +1,10 @@
+mne>=1.6.0
+mne-bids>=0.14
+torch>=2.0.0
+torchaudio>=2.0.0
+braindecode>=0.8.0
+scikit-learn
+pandas
+pyyaml
+tqdm
+matplotlib

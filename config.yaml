@@ -1,0 +1,26 @@
+dataset:
+  bids_root: "../BIDS"
+  task: "VCV"
+  subjects: ["03", "04", "05", "06", "07", "08", "09", "10", "12", "13", "14"]
+  datatype: "eeg"
+
+preprocessing:
+  l_freq: 1.0
+  h_freq: 100.0
+  resample_freq: 250
+  tmin: -0.2
+  tmax: 1.0
+  baseline: [-0.2, 0.0]
+
+model:
+  name: "EEGConformer" # Options: EEGConformer, EEGNetv4, ShallowFBCSPNet, Deep4Net
+  n_classes: 24 # Assuming some number of VCV classes, to be adapted
+  in_chans: 64 # Check dataset specific channel count
+  input_window_samples: 300 # (tmax - tmin) * resample_freq
+
+training:
+  batch_size: 32
+  epochs: 50
+  lr: 0.001
+  weight_decay: 0.0001
+  device: "cuda" # or "cpu"
