@@ -19,7 +19,7 @@ def load_syllable_epochs(config):
         raise ValueError(f"No .fif files found in {dir}. Please check your processed data.")
 
     all_epochs = []
-    for epoch_file in epoch_files:
+    for epoch_file in epoch_files[:2]:
         print(f"Loading {epoch_file}...")
         epochs = mne.read_epochs(epoch_file, verbose=False)
         all_epochs.append(epochs)

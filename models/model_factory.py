@@ -1,6 +1,6 @@
 import braindecode.models as bmodels
 
-def create_model(model_name, n_classes, in_chans, input_window_samples, chs_info=None, device="cpu"):
+def create_model(model_name, n_classes, in_chans, input_window_samples, chs_info=None, sfreq=None, device="cpu"):
     """
     Factory function to create Braindecode Pretrained Foundation Models.
     """
@@ -10,27 +10,35 @@ def create_model(model_name, n_classes, in_chans, input_window_samples, chs_info
     if model_name == "InterpolatedBIOT":
         # Wrap the foundation model with spatial interpolation
         model = bmodels.InterpolatedBIOT(
-            "braindecode/biot-pretrained-prest-16chs",
             chs_info=chs_info,
-            n_outputs=n_classes
+            n_outputs=n_classes,
+            n_times=input_window_samples,
+            n_chans=in_chans,
+            sfreq=sfreq
         )
     elif model_name == "InterpolatedBENDR":
         model = bmodels.InterpolatedBENDR(
-            "braindecode/braindecode-bendr",
             chs_info=chs_info,
-            n_outputs=n_classes
+            n_outputs=n_classes,
+            n_times=input_window_samples,
+            n_chans=in_chans,
+            sfreq=sfreq
         )
     elif model_name == "InterpolatedLaBraM":
         model = bmodels.InterpolatedLaBraM(
-            "braindecode/labram-pretrained",
             chs_info=chs_info,
-            n_outputs=n_classes
+            n_outputs=n_classes,
+            n_times=input_window_samples,
+            n_chans=in_chans,
+            sfreq=sfreq
         )
     elif model_name == "InterpolatedSignalJEPA":
         model = bmodels.InterpolatedSignalJEPA(
-            "braindecode/SignalJEPA-pretrained",
             chs_info=chs_info,
-            n_outputs=n_classes
+            n_outputs=n_classes,
+            n_times=input_window_samples,
+            n_chans=in_chans,
+            sfreq=sfreq
         )
     else:
         raise ValueError(f"Pretrained Model {model_name} not supported or implemented.")
