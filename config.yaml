@@ -9,24 +9,27 @@ dataset:
 
 
 preprocessing:
-  l_freq: 1.0
-  h_freq: 170.0
+  l_freq: 0.5
+  h_freq: 30.0
   resample_freq: None
   tmin: -0.2
   tmax: 1.0
   baseline: [-0.2, 0.0]
 
 
+decoding_type: Words # Syllables
+
+
 
 model:
-  name: "InterpolatedBIOT" # Options: EEGConformer, EEGNetv4, ShallowFBCSPNet, Deep4Net
-  n_classes: 24 # Assuming some number of VCV classes, to be adapted
+  name: "EEGNetv4" # Options: EEGConformer, EEGNetv4, ShallowFBCSPNet, Deep4Net
+  n_classes: 50 # Assuming some number of VCV classes, to be adapted
   in_chans: 64 # Check dataset specific channel count
-  input_window_samples: 300 # (tmax - tmin) * resample_freq
+  input_window_samples: 1200 # (tmax - tmin) * resample_freq
 
 training:
-  batch_size: 32
-  epochs: 50
+  batch_size: 256
+  epochs: 100
   lr: 0.001
   weight_decay: 0.0001
   device: "cuda" # or "cpu"
@@ -34,4 +37,5 @@ training:
 
 workflow:
   create_syllable_epochs: False
+  create_words_epochs: false
   

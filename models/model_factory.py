@@ -9,38 +9,52 @@ def create_model(model_name, n_classes, in_chans, input_window_samples, chs_info
         
     if model_name == "InterpolatedBIOT":
         # Wrap the foundation model with spatial interpolation
-        model = bmodels.InterpolatedBIOT(
+        model = bmodels.InterpolatedBIOT.from_pretrained(
+            "braindecode/biot-pretrained-six-datasets-18chs", # or "braindecode/biot-pretrained-prest-16chs"
             chs_info=chs_info,
             n_outputs=n_classes,
             n_times=input_window_samples,
             n_chans=in_chans,
-            sfreq=sfreq
+            sfreq=sfreq,
+            strict=False
         )
     elif model_name == "InterpolatedBENDR":
-        model = bmodels.InterpolatedBENDR(
+        model = bmodels.InterpolatedBENDR.from_pretrained(
+            "braindecode/braindecode-bendr",
             chs_info=chs_info,
             n_outputs=n_classes,
             n_times=input_window_samples,
             n_chans=in_chans,
-            sfreq=sfreq
+            sfreq=sfreq,
+            strict=False
         )
     elif model_name == "InterpolatedLaBraM":
-        model = bmodels.InterpolatedLaBraM(
+        model = bmodels.InterpolatedLaBraM.from_pretrained(
+            "braindecode/labram-pretrained",
             chs_info=chs_info,
             n_outputs=n_classes,
             n_times=input_window_samples,
             n_chans=in_chans,
-            sfreq=sfreq
+            sfreq=sfreq,
+            strict=False
         )
     elif model_name == "InterpolatedSignalJEPA":
-        model = bmodels.InterpolatedSignalJEPA(
+        model = bmodels.InterpolatedSignalJEPA.from_pretrained(
+            "braindecode/signal-jepa",
             chs_info=chs_info,
             n_outputs=n_classes,
             n_times=input_window_samples,
             n_chans=in_chans,
-            sfreq=sfreq
+            sfreq=sfreq,
+            strict=False
+        )
+    elif model_name == "EEGNetv4":
+        model = bmodels.EEGNetv4(
+            n_chans=in_chans,
+            n_outputs=n_classes,
+            n_times=input_window_samples
         )
     else:
-        raise ValueError(f"Pretrained Model {model_name} not supported or implemented.")
+        raise ValueError(f"Model {model_name} not supported or implemented.")
         
     return model.to(device)

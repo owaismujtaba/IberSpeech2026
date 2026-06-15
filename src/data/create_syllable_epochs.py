@@ -1,27 +1,43 @@
-import os
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, random_split
-from utils.config_parser import load_config, get_args, merge_args_with_config
-from data.bids_loader import load_subject_data, extract_events
-from data.preprocess import preprocess_raw, epoch_data
-from data.dataset import EEGEpochsDataset
-from models.model_factory import create_model
-from engine.trainer import train_one_epoch, evaluate
-from utils.save_data import save_epochs
+import hashlib
+
+from src.utils.config_parser import load_config
+from src.data.bids_loader import load_subject_data
+
+from src.preprocess.preprocess import preprocess_raw, epoch_data
+from src.utils.save_data import save_epochs
 import mne
 
 
+def extract_events(raw):
+    """
+    Extracts Speech events and event_id from a raw object, ignoring 
+    modality, experiment type, or whether it is real/silent.
+    Maps everything directly to the target syllable.
+    """
+    _, event_dict = mne.events_from_annotations(raw, verbose=False)
+    
+    custom_event_id = {}
+    for event_string in event_dict.keys():
+        if "StartSpeech" in event_string and "SyllablesExperiment" in event_string:
+            syllable = event_string.split('_')[-1]
+            hash_id = int(hashlib.md5(syllable.encode()).hexdigest(), 16) % 10000
+            custom_event_id[event_string] = hash_id
+    
+
+    events, event_id_mapped = mne.events_from_annotations(raw, event_id=custom_event_id, verbose=False)
+    
+    clean_event_id = {}
+    for event_string, h_id in event_id_mapped.items():
+        syllable = event_string.split('_')[-1]
+        clean_event_id[syllable] = h_id
+    
+    return events, clean_event_id
+
 
 def create_syllable_epochs():
-    args = get_args()
-    config = load_config(args.config)
-    config = merge_args_with_config(args, config)
+    config = load_config()
 
-    device = torch.device(config['training']['device'] if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
 
-    # 2. Load and Preprocess Data
     print("Loading datasets...")
     all_epochs = []
     for subject in config['dataset']['subjects']:
@@ -34,7 +50,6 @@ def create_syllable_epochs():
         )
         index = 0
         for raw in raws:
-            # Basic preprocessing
             index += 1
             raw = preprocess_raw(
                 raw,
@@ -56,7 +71,6 @@ def create_syllable_epochs():
                 tmax=config['preprocessing']['tmax'],
                 baseline=tuple(config['preprocessing']['baseline']) if config['preprocessing']['baseline'] else None
             )
-            #pdb.set_trace()
             save_epochs(epochs, name=f"sub-{subject}_ses-{index}", folder='syllable')
     
 if __name__ == "__main__":

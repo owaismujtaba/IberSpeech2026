@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 from .metrics import compute_metrics
+import pdb
 
 def train_one_epoch(model, dataloader, optimizer, criterion, device):
     model.train()
@@ -12,7 +13,7 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device):
     pbar = tqdm(dataloader, desc="Training")
     for batch_idx, (inputs, labels) in enumerate(pbar):
         inputs, labels = inputs.to(device), labels.to(device)
-
+        # pdb.set_trace()
         # Braindecode models handle 3D inputs natively (batch_size, n_channels, n_times)
 
         optimizer.zero_grad()
