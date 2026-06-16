@@ -2,31 +2,27 @@ dataset:
   bids_root: "BIDS"
   task: "VCV"
   subjects: ["01", "02","03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "14"]
-  #subjects: ["04", "02"]
   datatype: "eeg"
 
 
 
 
 preprocessing:
-  l_freq: 0.5
-  h_freq: 30.0
-  resample_freq: None
+  l_freq: 0.1
+  h_freq: 75.0
+  resample_freq: 200
   tmin: -0.2
-  tmax: 1.0
+  tmax: 1.5
   baseline: [-0.2, 0.0]
 
-
-decoding_type: Words # Syllables
-
+decoding: 
+    type: Words # Syllables/Words
+    train: True
 
 
 model:
-  name: "EEGNetv4" # Options: EEGConformer, EEGNetv4, ShallowFBCSPNet, Deep4Net
-  n_classes: 50 # Assuming some number of VCV classes, to be adapted
-  in_chans: 64 # Check dataset specific channel count
-  input_window_samples: 1200 # (tmax - tmin) * resample_freq
-
+  name: "EEGMamba" # Options: EEGConformer, EEGNetv4, ShallowFBCSPNet, Deep4Net
+  
 training:
   batch_size: 256
   epochs: 100
@@ -36,6 +32,6 @@ training:
 
 
 workflow:
-  create_syllable_epochs: False
+  create_syllable_epochs: false
   create_words_epochs: false
   
