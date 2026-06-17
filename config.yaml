@@ -24,7 +24,7 @@ model:
   name: "EEGMamba" # Options: EEGConformer, EEGNetv4, ShallowFBCSPNet, Deep4Net
   
 training:
-  batch_size: 256
+  batch_size: 64
   epochs: 100
   lr: 0.001
   weight_decay: 0.0001

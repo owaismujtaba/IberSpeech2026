@@ -6,139 +6,271 @@ from einops import rearrange, repeat, einsum
 import braindecode.models as bmodels
 
 class RMSNorm(nn.Module):
-    def __init__(self, d_model: int, eps: float = 1e-5):
+    def __init__(self, d: int, eps: float = 1e-5):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(d_model))
+        self.weight = nn.Parameter(torch.ones(d))
 
-    def forward(self, x):
-        output = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
-        return output
+    def forward(self, x, z=None):
+        if z is not None:
+            x = x * silu(z)
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
 
-class MambaBlock(nn.Module):
-    def __init__(self, d_model, d_state=16, expand=2, dt_rank='auto', d_conv=4, conv_bias=True, bias=False):
+def silu(x):
+    return x * torch.sigmoid(x)
+
+def segsum(x: torch.Tensor, device=None) -> torch.Tensor:
+    T = x.size(-1)
+    x = repeat(x, "... d -> ... d e", e=T)
+    mask = torch.tril(torch.ones(T, T, dtype=torch.bool, device=device), diagonal=-1)
+    x = x.masked_fill(~mask, 0)
+    x_segsum = torch.cumsum(x, dim=-2)
+    mask = torch.tril(torch.ones(T, T, dtype=torch.bool, device=device), diagonal=0)
+    x_segsum = x_segsum.masked_fill(~mask, -torch.inf)
+    return x_segsum
+
+def ssd(x, A, B, C, chunk_size, initial_states=None, device=None):
+    assert x.shape[1] % chunk_size == 0
+    x, A, B, C = [
+        rearrange(m, "b (c l) ... -> b c l ...", l=chunk_size) for m in (x, A, B, C)
+    ]
+
+    A = rearrange(A, "b c l h -> b h c l")
+    A_cumsum = torch.cumsum(A, dim=-1)
+
+    L = torch.exp(segsum(A, device=device))
+    Y_diag = torch.einsum("bclhn, bcshn, bhcls, bcshp -> bclhp", C, B, L, x)
+
+    decay_states = torch.exp(A_cumsum[:, :, :, -1:] - A_cumsum)
+    states = torch.einsum("bclhn, bhcl, bclhp -> bchpn", B, decay_states, x)
+
+    if initial_states is None:
+        initial_states = torch.zeros_like(states[:, :1])
+    states = torch.cat([initial_states, states], dim=1)
+    decay_chunk = torch.exp(segsum(F.pad(A_cumsum[:, :, :, -1], (1, 0)), device=device))
+    new_states = torch.einsum("bhzc, bchpn -> bzhpn", decay_chunk, states)
+    states, final_state = new_states[:, :-1], new_states[:, -1]
+
+    state_decay_out = torch.exp(A_cumsum)
+    Y_off = torch.einsum("bclhn, bchpn, bhcl -> bclhp", C, states, state_decay_out)
+
+    Y = rearrange(Y_diag + Y_off, "b c l h p -> b (c l) h p")
+
+    return Y, final_state
+
+class Mamba2(nn.Module):
+    def __init__(self, d_model, d_state=64, headdim=50, expand=2, chunk_size=64):
         super().__init__()
         self.d_model = d_model
         self.d_state = d_state
+        self.headdim = headdim
         self.expand = expand
-        self.d_inner = int(expand * d_model)
-        self.d_conv = d_conv
-        self.conv_bias = conv_bias
-        self.bias = bias
+        self.chunk_size = chunk_size
+        self.d_inner = expand * d_model
+        self.nheads = self.d_inner // headdim
         
-        if dt_rank == 'auto':
-            self.dt_rank = math.ceil(d_model / 16)
-        else:
-            self.dt_rank = dt_rank
+        # Order: (z, x, B, C, dt)
+        d_in_proj = 2 * self.d_inner + 2 * d_state + self.nheads
+        self.in_proj = nn.Linear(d_model, d_in_proj, bias=False)
 
-        self.in_proj = nn.Linear(d_model, self.d_inner * 2, bias=bias)
-
+        conv_dim = self.d_inner + 2 * d_state
         self.conv1d = nn.Conv1d(
-            in_channels=self.d_inner,
-            out_channels=self.d_inner,
-            bias=conv_bias,
-            kernel_size=d_conv,
-            groups=self.d_inner,
-            padding=d_conv - 1,
+            in_channels=conv_dim,
+            out_channels=conv_dim,
+            kernel_size=4,
+            groups=conv_dim,
+            padding=3,
         )
 
-        self.x_proj = nn.Linear(self.d_inner, self.dt_rank + self.d_state * 2, bias=False)
-        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
+        self.dt_bias = nn.Parameter(torch.empty(self.nheads))
+        self.A_log = nn.Parameter(torch.empty(self.nheads))
+        self.D = nn.Parameter(torch.empty(self.nheads))
+        self.norm = RMSNorm(self.d_inner)
+        self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
+        
+        # Initialize
+        nn.init.zeros_(self.dt_bias)
+        nn.init.ones_(self.A_log)
+        nn.init.ones_(self.D)
 
-        A = repeat(torch.arange(1, self.d_state + 1), 'n -> d n', d=self.d_inner)
-        self.A_log = nn.Parameter(torch.log(A))
-        self.D = nn.Parameter(torch.ones(self.d_inner))
-        self.out_proj = nn.Linear(self.d_inner, d_model, bias=bias)
+    def forward(self, u: torch.Tensor):
+        A = -torch.exp(self.A_log)
+        zxbcdt = self.in_proj(u)
+        z, xBC, dt = torch.split(
+            zxbcdt,
+            [
+                self.d_inner,
+                self.d_inner + 2 * self.d_state,
+                self.nheads,
+            ],
+            dim=-1,
+        )
+        dt = F.softplus(dt + self.dt_bias)
 
-    def forward(self, x):
-        (b, l, d) = x.shape
+        xBC = silu(
+            self.conv1d(xBC.transpose(1, 2)).transpose(1, 2)[:, : u.shape[1], :]
+        )
+        x, B, C = torch.split(
+            xBC, [self.d_inner, self.d_state, self.d_state], dim=-1
+        )
+        x = rearrange(x, "b l (h p) -> b l h p", p=self.headdim)
+        y, ssm_state = ssd(
+            x * dt.unsqueeze(-1),
+            A * dt,
+            rearrange(B, "b l n -> b l 1 n"),
+            rearrange(C, "b l n -> b l 1 n"),
+            self.chunk_size,
+            device=u.device,
+        )
+        y = y + x * self.D.unsqueeze(-1)
+        y = rearrange(y, "b l h p -> b l (h p)")
+        y = self.norm(y, z)
+        y = self.out_proj(y)
 
-        x_and_res = self.in_proj(x)
-        (x, res) = x_and_res.split(split_size=[self.d_inner, self.d_inner], dim=-1)
-
-        x = rearrange(x, 'b l d_in -> b d_in l')
-        x = self.conv1d(x)[:, :, :l]
-        x = rearrange(x, 'b d_in l -> b l d_in')
-
-        x = F.silu(x)
-        y = self.ssm(x)
-        y = y * F.silu(res)
-        output = self.out_proj(y)
-        return output
-
-    def ssm(self, x):
-        (d_in, n) = self.A_log.shape
-
-        A = -torch.exp(self.A_log.float())
-        D = self.D.float()
-
-        x_dbl = self.x_proj(x)
-        (delta, B, C) = x_dbl.split(split_size=[self.dt_rank, n, n], dim=-1)
-        delta = F.softplus(self.dt_proj(delta))
-
-        y = self.selective_scan(x, delta, A, B, C, D)
         return y
 
-    def selective_scan(self, u, delta, A, B, C, D):
-        (b, l, d_in) = u.shape
-        n = A.shape[1]
-
-        deltaA = torch.exp(einsum(delta, A, 'b l d_in, d_in n -> b l d_in n'))
-        deltaB_u = einsum(delta, B, u, 'b l d_in, b l n, b l d_in -> b l d_in n')
-
-        x = torch.zeros((b, d_in, n), device=deltaA.device)
-        ys = []    
-        for i in range(l):
-            x = deltaA[:, i] * x + deltaB_u[:, i]
-            y = einsum(x, C[:, i, :], 'b d_in n, b n -> b d_in')
-            ys.append(y)
-        y = torch.stack(ys, dim=1)
-
-        y = y + u * D
-        return y
-
-class ResidualBlock(nn.Module):
-    def __init__(self, d_model, d_state=16, expand=2):
+class Mamba2Layer(nn.Module):
+    def __init__(self, d_model, d_state=64, headdim=50, expand=2, chunk_size=64):
         super().__init__()
-        self.mixer = MambaBlock(d_model=d_model, d_state=d_state, expand=expand)
+        self.mixer = Mamba2(d_model=d_model, d_state=d_state, headdim=headdim, expand=expand, chunk_size=chunk_size)
         self.norm = RMSNorm(d_model)
 
     def forward(self, x):
         return self.mixer(self.norm(x)) + x
 
-class EEGMamba(nn.Module):
-    def __init__(self, n_chans, n_outputs, n_times, d_model=64, n_layers=2, d_state=16, expand=2):
+class MixerModel(nn.Module):
+    def __init__(self, d_model, n_layer=12, d_state=64, headdim=50, expand=2, chunk_size=64):
         super().__init__()
-        self.conv1 = nn.Conv2d(1, d_model, (n_chans, 1), bias=False)
-        self.bn1 = nn.BatchNorm2d(d_model)
-        self.elu = nn.ELU()
-        
-        # Downsample the temporal dimension by 4x to speed up sequence modeling
-        self.pool = nn.MaxPool2d((1, 4))
-        
-        self.mamba_layers = nn.ModuleList([
-            ResidualBlock(d_model=d_model, d_state=d_state, expand=expand)
-            for _ in range(n_layers)
+        self.layers = nn.ModuleList([
+            Mamba2Layer(d_model=d_model, d_state=d_state, headdim=headdim, expand=expand, chunk_size=chunk_size)
+            for _ in range(n_layer)
         ])
+        self.norm_f = RMSNorm(d_model)
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        x = self.norm_f(x)
+        return x
+
+class PatchEmbedding(nn.Module):
+    def __init__(self, in_dim, out_dim, d_model, seq_len):
+        super().__init__()
+        self.d_model = d_model
+        self.positional_encoding = nn.Sequential(
+            nn.Conv2d(in_channels=d_model, out_channels=d_model, kernel_size=(7, 7), stride=(1, 1), padding=(3, 3),
+                      groups=d_model, bias=False),
+        )
+        self.mask_encoding = nn.Parameter(torch.zeros(in_dim), requires_grad=False)
+
+        self.proj_in = nn.Sequential(
+            nn.Conv2d(in_channels=1, out_channels=25, kernel_size=(1, 49), stride=(1, 25), padding=(0, 24), bias=False),
+            nn.GroupNorm(5, 25),
+            nn.GELU(),
+        )
+        self.spectral_proj = nn.Sequential(
+            nn.Linear(101, d_model, bias=False),
+            nn.Dropout(0.1),
+        )
+
+    def forward(self, x, mask=None):
+        bz, ch_num, patch_num, patch_size = x.shape
+        if mask is None:
+            mask_x = x
+        else:
+            mask_x = x.clone()
+            mask_x[mask == 1] = self.mask_encoding
+
+        mask_x = rearrange(mask_x, 'b c l d -> b d c l')
+        time_x = rearrange(mask_x, 'b d c l -> b (c l) d').unsqueeze(1)
+
+        time_emb = self.proj_in(time_x)
+        time_emb = time_emb.permute(0, 2, 1, 3).contiguous().view(bz, ch_num, patch_num, self.d_model)
+
+        freq_x = rearrange(mask_x, 'b d c l -> b c l d')
+        spectral = torch.fft.rfft(freq_x, dim=-1, norm='forward')
+        spectral = torch.abs(spectral)
+        spectral_emb = self.spectral_proj(spectral)
+        patch_emb = time_emb + spectral_emb
+
+        positional_embedding = self.positional_encoding(patch_emb.permute(0, 3, 1, 2))
+        positional_embedding = positional_embedding.permute(0, 2, 3, 1)
+
+        patch_emb = patch_emb + positional_embedding
+
+        return patch_emb
+
+class EEGMamba(nn.Module):
+    def __init__(self, n_chans, n_outputs, n_times, d_model=200, n_layer=12, d_state=64, headdim=50, expand=2, chunk_size=64):
+        super().__init__()
+        self.n_chans = n_chans
+        self.n_times = n_times
+        self.d_model = d_model
+        self.chunk_size = chunk_size
         
-        self.norm = RMSNorm(d_model)
-        self.classifier = nn.Linear(d_model, n_outputs)
+        # Calculate patch dimensions
+        self.patch_size = 200
+        self.patch_num = math.ceil(n_times / self.patch_size)
+        self.pad_len = self.patch_num * self.patch_size - n_times
+        
+        self.patch_embedding = PatchEmbedding(in_dim=self.patch_size, out_dim=d_model, d_model=d_model, seq_len=self.patch_num)
+        
+        self.encoder = MixerModel(
+            d_model=d_model,
+            n_layer=n_layer,
+            d_state=d_state,
+            headdim=headdim,
+            expand=expand,
+            chunk_size=chunk_size
+        )
+        
+        self.proj_out = nn.Sequential(
+            nn.Linear(d_model, d_model)
+        )
+        
+        self.classifier = nn.Sequential(
+            nn.Linear(n_chans * self.patch_num * d_model, d_model),
+            nn.ELU(),
+            nn.Dropout(0.1),
+            nn.Linear(d_model, n_outputs)
+        )
 
     def forward(self, x):
         # Input shape: (batch_size, n_chans, n_times)
-        x = x.unsqueeze(1) # shape: (batch_size, 1, n_chans, n_times)
-        x = self.elu(self.bn1(self.conv1(x))) # shape: (batch_size, d_model, 1, n_times)
-        x = self.pool(x) # shape: (batch_size, d_model, 1, n_times // 4)
         
-        x = x.squeeze(2) # shape: (batch_size, d_model, seq_len)
-        x = x.permute(0, 2, 1) # shape: (batch_size, seq_len, d_model)
-        
-        for layer in self.mamba_layers:
-            x = layer(x)
+        # Pad time dimension to a multiple of patch_size (200)
+        if self.pad_len > 0:
+            x = F.pad(x, (0, self.pad_len))
             
-        x = self.norm(x)
-        x = x.mean(dim=1) # shape: (batch_size, d_model)
-        logits = self.classifier(x)
+        # Reshape to (batch_size, n_chans, patch_num, patch_size)
+        x = x.view(x.shape[0], self.n_chans, self.patch_num, self.patch_size)
+        
+        # Pass through patch embedding
+        hidden_states = self.patch_embedding(x)
+        
+        # Reshape for Mamba: (batch_size, n_chans * patch_num, d_model)
+        hidden_states = rearrange(hidden_states, 'b c l d -> b (c l) d')
+        
+        # Pad sequence dimension to a multiple of chunk_size (64)
+        seq_len = hidden_states.shape[1]
+        pad_seq = (self.chunk_size - seq_len % self.chunk_size) % self.chunk_size
+        if pad_seq > 0:
+            hidden_states = F.pad(hidden_states, (0, 0, 0, pad_seq))
+            
+        hidden_states = self.encoder(hidden_states)
+        
+        # Truncate back to original sequence length
+        if pad_seq > 0:
+            hidden_states = hidden_states[:, :seq_len, :]
+            
+        # Reshape back to (batch_size, n_chans, patch_num, d_model)
+        hidden_states = rearrange(hidden_states, 'b (c l) d -> b c l d', l=self.patch_num)
+        
+        out = self.proj_out(hidden_states)
+        
+        # Flatten and classify
+        out = rearrange(out, 'b c l d -> b (c l d)')
+        logits = self.classifier(out)
         return logits
 
 def create_model(config, n_chans, n_classes, n_times):
@@ -151,12 +283,28 @@ def create_model(config, n_chans, n_classes, n_times):
             n_times=n_times
         )
     elif model_name == 'EEGMamba':
-        print('Creating EEGMamba Model')
+        print('Creating EEGMamba Model with pretrained weights...')
         model = EEGMamba(
             n_chans=n_chans,
             n_outputs=n_classes,
             n_times=n_times
         )
+        try:
+            from huggingface_hub import hf_hub_download
+            print("Downloading pretrained weights from weighting666/EEGMamba...")
+            weights_path = hf_hub_download(repo_id="weighting666/EEGMamba", filename="pretrained_EEGMamba.pth")
+            print(f"Loading weights from {weights_path}")
+            state_dict = torch.load(weights_path, map_location='cpu')
+            
+            model_dict = model.state_dict()
+            # Only load matching weights and check shape compatibility
+            pretrained_dict = {k: v for k, v in state_dict.items() if k in model_dict and v.shape == model_dict[k].shape}
+            print(f"Successfully matched {len(pretrained_dict)} out of {len(state_dict)} pretrained parameters.")
+            model_dict.update(pretrained_dict)
+            model.load_state_dict(model_dict)
+            print("Pretrained weights loaded successfully into EEGMamba backbone!")
+        except Exception as e:
+            raise RuntimeError(f"Failed to load pretrained EEGMamba weights: {e}")
     else:
         raise ValueError(f"Unknown model name: {model_name}")
 
