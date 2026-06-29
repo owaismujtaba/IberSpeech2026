@@ -3,6 +3,8 @@ dataset:
   task: "VCV"
   subjects: ["01", "02","03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "14"]
   datatype: "eeg"
+  split_strategy: "leave_one_subject_out" # Options: "stratified_holdout", "leave_one_subject_out"
+  validation_subject: "14"
 
 
 
@@ -21,8 +23,7 @@ decoding:
 
 
 model:
-  name: "EEGMamba" # Options: EEGConformer, EEGNetv4, ShallowFBCSPNet, Deep4Net
-  
+  name: "EEGMamba" # Options: 
 training:
   batch_size: 64
   epochs: 100

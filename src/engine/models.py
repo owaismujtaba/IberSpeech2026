@@ -2,8 +2,12 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange, repeat, einsum
+from einops import rearrange, repeat
 import braindecode.models as bmodels
+import pdb
+# ==========================================
+# 1. Core Mathematical and Norm Foundations
+# ==========================================
 
 class RMSNorm(nn.Module):
     def __init__(self, d: int, eps: float = 1e-5):
@@ -28,6 +32,10 @@ def segsum(x: torch.Tensor, device=None) -> torch.Tensor:
     mask = torch.tril(torch.ones(T, T, dtype=torch.bool, device=device), diagonal=0)
     x_segsum = x_segsum.masked_fill(~mask, -torch.inf)
     return x_segsum
+
+# ==========================================
+# 2. Structured State Space Dual (SSD) Core
+# ==========================================
 
 def ssd(x, A, B, C, chunk_size, initial_states=None, device=None):
     assert x.shape[1] % chunk_size == 0
@@ -57,6 +65,10 @@ def ssd(x, A, B, C, chunk_size, initial_states=None, device=None):
     Y = rearrange(Y_diag + Y_off, "b c l h p -> b (c l) h p")
 
     return Y, final_state
+
+# ==========================================
+# 3. Mamba-2 Layers
+# ==========================================
 
 class Mamba2(nn.Module):
     def __init__(self, d_model, d_state=64, headdim=50, expand=2, chunk_size=64):
@@ -153,6 +165,10 @@ class MixerModel(nn.Module):
         x = self.norm_f(x)
         return x
 
+# ==========================================
+# 4. Front-End Feature Extraction Front-End
+# ==========================================
+
 class PatchEmbedding(nn.Module):
     def __init__(self, in_dim, out_dim, d_model, seq_len):
         super().__init__()
@@ -174,6 +190,7 @@ class PatchEmbedding(nn.Module):
         )
 
     def forward(self, x, mask=None):
+        pdb.set_trace()
         bz, ch_num, patch_num, patch_size = x.shape
         if mask is None:
             mask_x = x
@@ -199,6 +216,10 @@ class PatchEmbedding(nn.Module):
         patch_emb = patch_emb + positional_embedding
 
         return patch_emb
+
+# ==========================================
+# 5. Integrated EEGMamba Framework
+# ==========================================
 
 class EEGMamba(nn.Module):
     def __init__(self, n_chans, n_outputs, n_times, d_model=200, n_layer=12, d_state=64, headdim=50, expand=2, chunk_size=64):
@@ -228,14 +249,18 @@ class EEGMamba(nn.Module):
             nn.Linear(d_model, d_model)
         )
         
+        # FIX: Replaced flattened linear bottleneck with an expressive, deep,
+        # non-linear classification head tailored for downstream 90-class margins.
         self.classifier = nn.Sequential(
-            nn.Linear(n_chans * self.patch_num * d_model, d_model),
-            nn.ELU(),
-            nn.Dropout(0.1),
-            nn.Linear(d_model, n_outputs)
+            nn.Linear(d_model, 512),
+            nn.LayerNorm(512),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, n_outputs)
         )
 
     def forward(self, x):
+        pdb.set_trace()
         # Input shape: (batch_size, n_chans, n_times)
         
         # Pad time dimension to a multiple of patch_size (200)
@@ -266,12 +291,19 @@ class EEGMamba(nn.Module):
         # Reshape back to (batch_size, n_chans, patch_num, d_model)
         hidden_states = rearrange(hidden_states, 'b (c l) d -> b c l d', l=self.patch_num)
         
-        out = self.proj_out(hidden_states)
+        out = self.proj_out(hidden_states) # (batch, channels, patches, d_model)
         
-        # Flatten and classify
-        out = rearrange(out, 'b c l d -> b (c l d)')
+        # FIX: Swapped global flattening out for a Spatial-Temporal Global Average Pooling.
+        # This keeps the feature vector scale stable across input configurations and retains
+        # the descriptive integrity of the pretrained representations.
+        out = torch.mean(out, dim=[1, 2]) # (batch, d_model)
+        
         logits = self.classifier(out)
         return logits
+
+# ==========================================
+# 6. Model Generation & Pretrained Initialization
+# ==========================================
 
 def create_model(config, n_chans, n_classes, n_times):
     model_name = config['model']['name']
@@ -297,12 +329,19 @@ def create_model(config, n_chans, n_classes, n_times):
             state_dict = torch.load(weights_path, map_location='cpu')
             
             model_dict = model.state_dict()
-            # Only load matching weights and check shape compatibility
-            pretrained_dict = {k: v for k, v in state_dict.items() if k in model_dict and v.shape == model_dict[k].shape}
-            print(f"Successfully matched {len(pretrained_dict)} out of {len(state_dict)} pretrained parameters.")
+            
+            # FIX: Explicitly exclude 'classifier' keys from weight matches.
+            # This ensures your backbone loads pretrained features correctly, while your downstream
+            # 90-class classification layers initialize fresh without random matrix collisions.
+            pretrained_dict = {
+                k: v for k, v in state_dict.items() 
+                if k in model_dict and "classifier" not in k and v.shape == model_dict[k].shape
+            }
+            
+            print(f"Successfully matched {len(pretrained_dict)} out of {len(state_dict)} pretrained backbone parameters.")
             model_dict.update(pretrained_dict)
             model.load_state_dict(model_dict)
-            print("Pretrained weights loaded successfully into EEGMamba backbone!")
+            print("Pretrained Mamba-2 backbone loaded successfully! Downstream head configured for fine-tuning.")
         except Exception as e:
             raise RuntimeError(f"Failed to load pretrained EEGMamba weights: {e}")
     else:

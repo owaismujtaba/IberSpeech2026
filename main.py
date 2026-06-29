@@ -19,10 +19,11 @@ create_words = config['workflow'].get('create_words_epochs', False)
 if create_syllable or create_words:
     create_epochs(create_syllable=create_syllable, create_words=create_words)
 
+#pdb.set_trace()
 if config['decoding']['type'] == 'Syllable':
-    train_epochs, val_epochs = load_and_split_per_file()
+    train_epochs, val_epochs = load_and_split_per_file(config)
 else:
-    train_epochs, val_epochs = load_and_split_per_file(directory='words')
+    train_epochs, val_epochs = load_and_split_per_file(config, directory='words')
     
 
 if config['decoding']['train']:
