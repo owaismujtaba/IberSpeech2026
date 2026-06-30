@@ -1,38 +1,44 @@
 dataset:
   bids_root: "BIDS"
   task: "VCV"
-  subjects: ["01", "02","03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "14"]
+  subjects: ["01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "14"]
   datatype: "eeg"
-  split_strategy: "leave_one_subject_out" # Options: "stratified_holdout", "leave_one_subject_out"
-  validation_subject: "14"
-
-
 
 
 preprocessing:
   l_freq: 0.1
   h_freq: 75.0
+  notch_freq: 50.0
   resample_freq: 200
   tmin: -0.2
   tmax: 1.5
   baseline: [-0.2, 0.0]
 
-decoding: 
-    type: Words # Syllables/Words
-    train: True
 
+decoding:
+  # Any subset of: speech_mode (Overt/Covert/Rest), semantic_category (6 cats), word (60 words)
+  tasks: [speech_mode, semantic_category, word]
+  split: loso
+
+
+# Models to train and compare. Options:
+#   EEGNetv4, EEGConformer, ShallowFBCSPNet, Deep4Net, LaBraM, EEGMamba
+models: [EEGMamba]
 
 model:
-  name: "EEGMamba" # Options: 
+  name: "EEGNetv4"   # default used when `models` is not set
+
+
 training:
   batch_size: 64
   epochs: 100
   lr: 0.001
   weight_decay: 0.0001
-  device: "cuda" # or "cpu"
+  patience: 10
+  device: "cuda"   # or "cpu"
+  seed: 42         # global RNG seed for reproducible runs
 
 
 workflow:
-  create_syllable_epochs: false
+  # Set true once to (re)create Words epochs with metadata under processed/words/.
   create_words_epochs: false
-  

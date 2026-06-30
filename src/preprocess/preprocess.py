@@ -1,76 +1,122 @@
 import mne
+import numpy as np
+from src.utils.logger import get_logger
 
-def preprocess_raw(raw, l_freq=1.0, h_freq=100.0, resample_freq=None):
+log = get_logger()
+
+
+def preprocess_raw(raw, l_freq=0.1, h_freq=75.0, notch_freq=50.0, resample_freq=None):
     """
-    Applies basic preprocessing: filtering, ICA, re-referencing, resampling, and scaling.
+    Full preprocessing pipeline:
+      1. Bandpass filter (l_freq – h_freq Hz)
+      2. Notch filter at notch_freq Hz
+      3. ICA (auto-remove ocular + cardiac components)
+      4. Drop non-EEG channels (EOG kept until after ICA for artifact detection)
+      5. Average reference
+    Data is kept in Volts (MNE standard). µV values are logged for readability.
     """
-    print(f"Preprocessing raw data: l_freq={l_freq}, h_freq={h_freq}, resample_freq={resample_freq}")
-    
+    info = raw.info
+    log.info(
+        f"[PREPROC] Input  →  channels={len(info['ch_names'])}  "
+        f"sfreq={info['sfreq']:.1f} Hz  "
+        f"amplitude range=[{raw.get_data().min()*1e6:.2f}, {raw.get_data().max()*1e6:.2f}] µV"
+    )
+
     raw.set_montage('standard_1020', match_case=False, on_missing='ignore')
-    
-    # 1. Bandpass filter
-    print(f"Applying bandpass filter ({l_freq} - {h_freq} Hz)...")
-    raw.filter(l_freq=l_freq, h_freq=h_freq, fir_design='firwin', verbose=False)
-    
-    # 2. Notch filter (50 Hz)
-    print("Applying notch filter (50 Hz)...")
-    raw.notch_filter(freqs=50.0, verbose=False)
 
-    # 3. ICA (Independent Component Analysis) for artifact removal
-    print("Fitting ICA to remove eye/muscle artifacts...")
+    # 1. Bandpass filter
+    log.info(f"[PREPROC] Bandpass  {l_freq}–{h_freq} Hz")
+    raw.filter(l_freq=l_freq, h_freq=h_freq, fir_design='firwin', verbose=False)
+
+    # 3. Notch filter
+    log.info(f"[PREPROC] Notch filter at {notch_freq} Hz")
+    raw.notch_filter(freqs=notch_freq, verbose=False)
+
+    # 4. ICA for artifact removal
+    log.info("[PREPROC] Fitting ICA to remove eye/muscle artifacts ...")
     try:
-        # Check if EOG channels are present in the raw data
         present_ref = [ch for ch in ['EOG1', 'EOG2'] if ch in raw.ch_names]
-        
-        # If not present, fall back to TP9 and TP10
         if not present_ref:
             present_ref = [ch for ch in ['TP9', 'TP10'] if ch in raw.ch_names]
-        
-        # Fit ICA on EEG channels
+
         ica = mne.preprocessing.ICA(n_components=15, max_iter='auto', random_state=97)
         ica.fit(raw, picks='eeg', verbose=False)
-        
+
         if present_ref:
-            print(f"Detecting eye artifacts using reference channels: {present_ref}")
-            eog_indices, eog_scores = ica.find_bads_eog(raw, ch_name=present_ref, threshold=3.0, verbose=False)
+            log.info(f"[PREPROC] Detecting eye artifacts using reference channels: {present_ref}")
+            eog_indices, _ = ica.find_bads_eog(raw, ch_name=present_ref, threshold=3.0, verbose=False)
             ica.exclude = eog_indices
-            print(f"Excluded {len(eog_indices)} ICA components: {eog_indices}")
+            log.info(f"[PREPROC] Excluded {len(eog_indices)} ICA components: {eog_indices}")
         else:
-            print("No reference channels found for automatic component rejection.")
-            
-        # Apply ICA
+            log.info("[PREPROC] No reference channels found for automatic component rejection.")
+
         ica.apply(raw, verbose=False)
     except Exception as e:
-        print(f"Warning: ICA fitting failed with error: {e}. Proceeding without ICA.")
+        log.warning(f"[PREPROC] ICA fitting failed: {e}. Proceeding without ICA.")
 
-    # 4. Drop irrelevant channels (EOG and mastoids)
-    print("Dropping irrelevant channels...")
+    # 5. Drop non-EEG channels after ICA (EOG channels were needed for artifact detection)
+    before = len(raw.ch_names)
     raw.drop_channels(['EOG1', 'EOG2', 'TP9', 'TP10'], on_missing='ignore')
+    dropped = before - len(raw.ch_names)
+    if dropped:
+        log.info(f"[PREPROC] Dropped {dropped} non-EEG channel(s)  →  {len(raw.ch_names)} remaining")
 
-    print("Setting average reference...")
+    # 6. Average reference
     raw.set_eeg_reference('average', projection=False, verbose=False)
+    log.info("[PREPROC] Applied average reference")
 
-    if resample_freq is not None and resample_freq != 'None' and resample_freq != 'none':
-        print(f"Resampling data to {resample_freq} Hz...")
-        raw.resample(sfreq=float(resample_freq), verbose=False)
-    print("Scaling EEG data to µV...")
-    raw.apply_function(lambda x: x * 1e6, picks='eeg', verbose=False)
+    data = raw.get_data()
+    log.info(
+        f"[PREPROC] Output  →  shape={data.shape}  "
+        f"amplitude range=[{data.min()*1e6:.2f}, {data.max()*1e6:.2f}] µV  "
+        f"std={data.std()*1e6:.4f} µV"
+    )
+
+    # Optional resampling
+    if resample_freq and resample_freq != raw.info['sfreq']:
+        log.info(f"[PREPROC] Resampling  {raw.info['sfreq']:.1f} Hz → {resample_freq} Hz")
+        raw.resample(resample_freq, verbose=False)
+        log.info(f"[PREPROC] After resample  →  shape={raw.get_data().shape}")
 
     return raw
 
-def epoch_data(raw, events, event_id, tmin=-0.2, tmax=1.0, baseline=(-0.2, 0.0)):
+
+def epoch_data(raw, events, event_id, tmin=-0.2, tmax=1.5, baseline=(-0.2, 0.0),
+               metadata=None):
     """
     Creates epochs from continuous raw data.
+
+    ``metadata`` (optional pandas DataFrame, aligned row-for-row with ``events``)
+    is attached to the resulting epochs so callers can derive task-specific labels.
     """
+    log.info(
+        f"[EPOCH] Creating epochs  tmin={tmin}s  tmax={tmax}s  "
+        f"baseline={baseline}  n_events={len(events)}  n_classes={len(event_id)}"
+    )
+
     epochs = mne.Epochs(
-        raw, 
-        events, 
-        event_id=event_id, 
-        tmin=tmin, 
-        tmax=tmax, 
-        baseline=baseline, 
+        raw,
+        events,
+        event_id=event_id,
+        tmin=tmin,
+        tmax=tmax,
+        baseline=baseline,
         preload=True,
+        metadata=metadata,
         event_repeated='drop',
         verbose=False
     )
+
+    data = epochs.get_data()
+    log.info(
+        f"[EPOCH] Output  →  shape={data.shape}  "
+        f"(n_epochs={data.shape[0]}, n_channels={data.shape[1]}, n_times={data.shape[2]})  "
+        f"sfreq={epochs.info['sfreq']:.1f} Hz  "
+        f"amplitude range=[{data.min()*1e6:.2f}, {data.max()*1e6:.2f}] µV"
+    )
+
+    counts = {k: int((epochs.events[:, 2] == v).sum()) for k, v in epochs.event_id.items()}
+    min_c, max_c = min(counts.values()), max(counts.values())
+    log.info(f"[EPOCH] Trials per class  min={min_c}  max={max_c}  total={len(epochs)}")
+
     return epochs

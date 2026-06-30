@@ -2,12 +2,8 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange, repeat
+from einops import rearrange, repeat, einsum
 import braindecode.models as bmodels
-import pdb
-# ==========================================
-# 1. Core Mathematical and Norm Foundations
-# ==========================================
 
 class RMSNorm(nn.Module):
     def __init__(self, d: int, eps: float = 1e-5):
@@ -32,10 +28,6 @@ def segsum(x: torch.Tensor, device=None) -> torch.Tensor:
     mask = torch.tril(torch.ones(T, T, dtype=torch.bool, device=device), diagonal=0)
     x_segsum = x_segsum.masked_fill(~mask, -torch.inf)
     return x_segsum
-
-# ==========================================
-# 2. Structured State Space Dual (SSD) Core
-# ==========================================
 
 def ssd(x, A, B, C, chunk_size, initial_states=None, device=None):
     assert x.shape[1] % chunk_size == 0
@@ -65,10 +57,6 @@ def ssd(x, A, B, C, chunk_size, initial_states=None, device=None):
     Y = rearrange(Y_diag + Y_off, "b c l h p -> b (c l) h p")
 
     return Y, final_state
-
-# ==========================================
-# 3. Mamba-2 Layers
-# ==========================================
 
 class Mamba2(nn.Module):
     def __init__(self, d_model, d_state=64, headdim=50, expand=2, chunk_size=64):
@@ -165,10 +153,6 @@ class MixerModel(nn.Module):
         x = self.norm_f(x)
         return x
 
-# ==========================================
-# 4. Front-End Feature Extraction Front-End
-# ==========================================
-
 class PatchEmbedding(nn.Module):
     def __init__(self, in_dim, out_dim, d_model, seq_len):
         super().__init__()
@@ -190,7 +174,6 @@ class PatchEmbedding(nn.Module):
         )
 
     def forward(self, x, mask=None):
-        pdb.set_trace()
         bz, ch_num, patch_num, patch_size = x.shape
         if mask is None:
             mask_x = x
@@ -216,10 +199,6 @@ class PatchEmbedding(nn.Module):
         patch_emb = patch_emb + positional_embedding
 
         return patch_emb
-
-# ==========================================
-# 5. Integrated EEGMamba Framework
-# ==========================================
 
 class EEGMamba(nn.Module):
     def __init__(self, n_chans, n_outputs, n_times, d_model=200, n_layer=12, d_state=64, headdim=50, expand=2, chunk_size=64):
@@ -249,18 +228,14 @@ class EEGMamba(nn.Module):
             nn.Linear(d_model, d_model)
         )
         
-        # FIX: Replaced flattened linear bottleneck with an expressive, deep,
-        # non-linear classification head tailored for downstream 90-class margins.
         self.classifier = nn.Sequential(
-            nn.Linear(d_model, 512),
-            nn.LayerNorm(512),
-            nn.GELU(),
-            nn.Dropout(0.3),
-            nn.Linear(512, n_outputs)
+            nn.Linear(n_chans * self.patch_num * d_model, d_model),
+            nn.ELU(),
+            nn.Dropout(0.1),
+            nn.Linear(d_model, n_outputs)
         )
 
     def forward(self, x):
-        pdb.set_trace()
         # Input shape: (batch_size, n_chans, n_times)
         
         # Pad time dimension to a multiple of patch_size (200)
@@ -291,29 +266,108 @@ class EEGMamba(nn.Module):
         # Reshape back to (batch_size, n_chans, patch_num, d_model)
         hidden_states = rearrange(hidden_states, 'b (c l) d -> b c l d', l=self.patch_num)
         
-        out = self.proj_out(hidden_states) # (batch, channels, patches, d_model)
+        out = self.proj_out(hidden_states)
         
-        # FIX: Swapped global flattening out for a Spatial-Temporal Global Average Pooling.
-        # This keeps the feature vector scale stable across input configurations and retains
-        # the descriptive integrity of the pretrained representations.
-        out = torch.mean(out, dim=[1, 2]) # (batch, d_model)
-        
+        # Flatten and classify
+        out = rearrange(out, 'b c l d -> b (c l d)')
         logits = self.classifier(out)
         return logits
 
-# ==========================================
-# 6. Model Generation & Pretrained Initialization
-# ==========================================
+class LaBraM(nn.Module):
+    """
+    braindecode's LaBraM, wrapped to (1) pad epochs to a whole number of patches and
+    (2) carry the montage channel names the pretrained model needs to map our channels
+    onto its canonical layout. Pretrained weights are loaded in ``create_model``.
+    """
+    def __init__(self, n_chans, n_outputs, n_times, ch_names, patch_size=200):
+        super().__init__()
+        self.ch_names = list(ch_names)
+        self.pad_len = (patch_size - n_times % patch_size) % patch_size
+        self.model = bmodels.Labram(
+            n_times=n_times + self.pad_len,
+            n_chans=n_chans,
+            n_outputs=n_outputs,
+            patch_size=patch_size,
+        )
 
-def create_model(config, n_chans, n_classes, n_times):
+    def forward(self, x):
+        if self.pad_len:
+            x = F.pad(x, (0, self.pad_len))
+        return self.model(x, ch_names=self.ch_names)
+
+
+def create_model(config, n_chans, n_classes, n_times, ch_names=None):
     model_name = config['model']['name']
     if model_name == 'EEGNetv4':
-        print('Creating EEGNetV4 Model')
+        print('Creating EEGNetv4 Model')
         model = bmodels.EEGNetv4(
             n_chans=n_chans,
             n_outputs=n_classes,
             n_times=n_times
         )
+    elif model_name == 'EEGConformer':
+        print('Creating EEGConformer Model')
+        model = bmodels.EEGConformer(
+            n_chans=n_chans,
+            n_outputs=n_classes,
+            n_times=n_times,
+            final_fc_length='auto',
+        )
+    elif model_name == 'ShallowFBCSPNet':
+        print('Creating ShallowFBCSPNet Model')
+        model = bmodels.ShallowFBCSPNet(
+            n_chans=n_chans,
+            n_outputs=n_classes,
+            n_times=n_times,
+            final_conv_length='auto',
+        )
+    elif model_name == 'Deep4Net':
+        print('Creating Deep4Net Model')
+        # Default pooling (stride 3 over 4 conv-pool blocks) collapses the time axis
+        # for our short 341-sample epochs (1.7s @ 200 Hz). Gentler pooling keeps the
+        # feature map non-empty while retaining the standard filter lengths.
+        model = bmodels.Deep4Net(
+            n_chans=n_chans,
+            n_outputs=n_classes,
+            n_times=n_times,
+            final_conv_length='auto',
+            pool_time_length=2,
+            pool_time_stride=2,
+        )
+    elif model_name == 'LaBraM':
+        print('Creating LaBraM Model with pretrained weights...')
+        if ch_names is None:
+            raise ValueError("LaBraM requires ch_names (the EEG montage) to map channels "
+                             "onto the pretrained canonical layout.")
+        model = LaBraM(
+            n_chans=n_chans,
+            n_outputs=n_classes,
+            n_times=n_times,
+            ch_names=ch_names,
+        )
+        try:
+            url = "https://huggingface.co/braindecode/Labram-Braindecode/resolve/main/braindecode_labram_base.pt"
+            print(f"Downloading pretrained LaBraM-Base weights from {url}")
+            state_dict = torch.hub.load_state_dict_from_url(url, progress=True, map_location='cpu')
+            if isinstance(state_dict, dict) and 'state_dict' in state_dict:
+                state_dict = state_dict['state_dict']
+
+            inner = model.model
+            model_dict = inner.state_dict()
+            pretrained_dict = {k: v for k, v in state_dict.items()
+                               if k in model_dict and v.shape == model_dict[k].shape}
+            # The classification head and a few positional embeddings are intentionally
+            # left at their fresh init (different class count / epoch length than pre-training).
+            if len(pretrained_dict) < 0.5 * len(model_dict):
+                raise RuntimeError(f"Only matched {len(pretrained_dict)}/{len(model_dict)} "
+                                   f"params — checkpoint/architecture mismatch.")
+            print(f"Successfully matched {len(pretrained_dict)} out of {len(model_dict)} "
+                  f"model parameters (head + positional embeddings reinitialised).")
+            model_dict.update(pretrained_dict)
+            inner.load_state_dict(model_dict)
+            print("Pretrained weights loaded successfully into LaBraM backbone!")
+        except Exception as e:
+            raise RuntimeError(f"Failed to load pretrained LaBraM weights: {e}")
     elif model_name == 'EEGMamba':
         print('Creating EEGMamba Model with pretrained weights...')
         model = EEGMamba(
@@ -327,24 +381,17 @@ def create_model(config, n_chans, n_classes, n_times):
             weights_path = hf_hub_download(repo_id="weighting666/EEGMamba", filename="pretrained_EEGMamba.pth")
             print(f"Loading weights from {weights_path}")
             state_dict = torch.load(weights_path, map_location='cpu')
-            
+
             model_dict = model.state_dict()
-            
-            # FIX: Explicitly exclude 'classifier' keys from weight matches.
-            # This ensures your backbone loads pretrained features correctly, while your downstream
-            # 90-class classification layers initialize fresh without random matrix collisions.
-            pretrained_dict = {
-                k: v for k, v in state_dict.items() 
-                if k in model_dict and "classifier" not in k and v.shape == model_dict[k].shape
-            }
-            
-            print(f"Successfully matched {len(pretrained_dict)} out of {len(state_dict)} pretrained backbone parameters.")
+            pretrained_dict = {k: v for k, v in state_dict.items() if k in model_dict and v.shape == model_dict[k].shape}
+            print(f"Successfully matched {len(pretrained_dict)} out of {len(state_dict)} pretrained parameters.")
             model_dict.update(pretrained_dict)
             model.load_state_dict(model_dict)
-            print("Pretrained Mamba-2 backbone loaded successfully! Downstream head configured for fine-tuning.")
+            print("Pretrained weights loaded successfully into EEGMamba backbone!")
         except Exception as e:
             raise RuntimeError(f"Failed to load pretrained EEGMamba weights: {e}")
     else:
-        raise ValueError(f"Unknown model name: {model_name}")
+        raise ValueError(f"Unknown model name: {model_name}. "
+                         f"Options: EEGNetv4, EEGConformer, ShallowFBCSPNet, Deep4Net, LaBraM, EEGMamba")
 
     return model

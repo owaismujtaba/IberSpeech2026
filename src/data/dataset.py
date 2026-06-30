@@ -1,167 +1,136 @@
-import mne
+"""
+Load Words-experiment epochs and build Leave-One-Subject-Out (LOSO) folds.
+
+A single epoch set (created by ``create_epochs``) carries metadata for all three
+decoding tasks; the task selects which epochs to keep and which column to use as the
+label. Each task has a *fixed* vocabulary so the model's output dimension is identical
+across every LOSO fold.
+"""
 import os
 from pathlib import Path
-import torch
-import json
-from collections import Counter
-# pyrefly: ignore [missing-import]
-from torch.utils.data import Dataset
-from sklearn.model_selection import train_test_split
-import pdb
+
+import mne
 import numpy as np
 
+from src.data.labels import CATEGORIES, load_word_categories
+from src.utils.config_parser import load_config
+from src.utils.logger import get_logger
+
+log = get_logger()
+
 import warnings
-warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*does not conform to MNE naming conventions.*")
+warnings.filterwarnings("ignore", category=RuntimeWarning,
+                        message=".*does not conform to MNE naming conventions.*")
+
+TASKS = ("speech_mode", "semantic_category", "word")
 
 
+def task_vocabulary(task: str) -> list:
+    """Fixed, sorted label vocabulary for a task → stable label→index mapping."""
+    if task == "speech_mode":
+        return ["Covert", "Overt", "Rest"]
+    if task == "semantic_category":
+        return list(CATEGORIES)
+    if task == "word":
+        return sorted(load_word_categories().keys())
+    raise ValueError(f"Unknown task '{task}'. Options: {TASKS}")
 
 
-def load_and_split_per_file(config=None, test_size=0.2, random_state=42, directory='syllable'):
-    if config is None:
-        from src.utils.config_parser import load_config
-        config = load_config()
-
-    dir = Path(os.getcwd(), "processed", directory)
-
-    if not dir.exists():
-        raise ValueError(f"Directory {dir} does not exist. Please run create_epochs first.")
-
-    epoch_files = list(dir.glob("*.fif"))
-
-    if len(epoch_files) == 0:
-        raise ValueError(f"No .fif files found in {dir}. Please check your processed data.")
-
-    unique_events = set()
-    for epoch_file in epoch_files:
-        epochs = mne.read_epochs(epoch_file, preload=False, verbose=False)
-        current_id_to_label = {v: k for k, v in epochs.event_id.items()}
-        # Only add event labels that actually exist in the events array of this subject/run
-        present_ids = np.unique(epochs.events[:, 2])
-        for p_id in present_ids:
-            if p_id in current_id_to_label:
-                unique_events.add(current_id_to_label[p_id])
-
-    sorted_events = sorted(unique_events)
-    target_event_id = {label: idx for idx, label in enumerate(sorted_events)}
-
-    print("Enforcing unified Event ID mapping:")
-    for label, idx in target_event_id.items():
-        print(f"  {label} -> {idx}")
-    print("-" * 40)
-
-    split_strategy = config.get('dataset', {}).get('split_strategy', 'stratified_holdout')
-    
-    all_train_splits = []
-    all_test_splits = []
-
-    if split_strategy == 'leave_one_subject_out':
-        validation_subject = config.get('dataset', {}).get('validation_subject', '14')
-        if isinstance(validation_subject, int):
-            validation_subject = f"{validation_subject:02d}"
-        elif isinstance(validation_subject, str) and len(validation_subject) == 1:
-            validation_subject = f"0{validation_subject}"
-            
-        print(f"Applying Leave-One-Subject-Out strategy (Validation subject: sub-{validation_subject})")
-        
-        train_files = []
-        val_files = []
-        for epoch_file in epoch_files:
-            if epoch_file.name.startswith(f"sub-{validation_subject}_"):
-                val_files.append(epoch_file)
-            else:
-                train_files.append(epoch_file)
-                
-        if len(val_files) == 0:
-            raise ValueError(f"No files found for validation subject: sub-{validation_subject} in {dir}")
-        if len(train_files) == 0:
-            raise ValueError(f"No files found for training subjects in {dir}")
-            
-        for epoch_file in train_files:
-            print(f"Processing training subject file {epoch_file.name}...")
-            epochs = mne.read_epochs(epoch_file, preload=True, verbose=False)
-            epochs.set_annotations(None)
-            current_id_to_label = {v: k for k, v in epochs.event_id.items()}
-            new_events = epochs.events.copy()
-            for i in range(len(new_events)):
-                old_id = new_events[i, 2]
-                label = current_id_to_label[old_id]
-                new_events[i, 2] = target_event_id[label]
-            epochs.events = new_events
-            epochs.event_id = target_event_id
-            all_train_splits.append(epochs)
-            
-        for epoch_file in val_files:
-            print(f"Processing validation subject file {epoch_file.name}...")
-            epochs = mne.read_epochs(epoch_file, preload=True, verbose=False)
-            epochs.set_annotations(None)
-            current_id_to_label = {v: k for k, v in epochs.event_id.items()}
-            new_events = epochs.events.copy()
-            for i in range(len(new_events)):
-                old_id = new_events[i, 2]
-                label = current_id_to_label[old_id]
-                new_events[i, 2] = target_event_id[label]
-            epochs.events = new_events
-            epochs.event_id = target_event_id
-            all_test_splits.append(epochs)
+def select_labels(metadata, task: str):
+    """
+    Given an epochs ``metadata`` DataFrame, return ``(mask, labels)`` where ``mask`` is
+    a boolean array selecting the epochs used by ``task`` and ``labels`` is the matching
+    array of string labels for the kept epochs.
+    """
+    if task == "speech_mode":
+        mask = metadata["mode"].notna().to_numpy()
+        labels = metadata.loc[mask, "mode"].to_numpy()
+    elif task == "semantic_category":
+        mask = metadata["category"].notna().to_numpy()
+        labels = metadata.loc[mask, "category"].to_numpy()
+    elif task == "word":
+        # Real words only == those with a semantic category.
+        mask = metadata["category"].notna().to_numpy()
+        labels = metadata.loc[mask, "word"].to_numpy()
     else:
-        rng = np.random.RandomState(random_state)
-        for epoch_file in epoch_files:
-            print(f"Processing and splitting {epoch_file.name}...")
-            epochs = mne.read_epochs(epoch_file, preload=True, verbose=False)
-            epochs.set_annotations(None)
-            current_id_to_label = {v: k for k, v in epochs.event_id.items()}
-            new_events = epochs.events.copy()
-            for i in range(len(new_events)):
-                old_id = new_events[i, 2]
-                label = current_id_to_label[old_id]
-                new_events[i, 2] = target_event_id[label]
-            epochs.events = new_events
-            epochs.event_id = target_event_id
+        raise ValueError(f"Unknown task '{task}'. Options: {TASKS}")
+    return mask, labels
 
-            labels = epochs.events[:, -1]
-            class_counts = Counter(labels)
 
-            if all(count >= 2 for count in class_counts.values()):
-                train_idx, test_idx = train_test_split(np.arange(len(epochs)), test_size=test_size, random_state=random_state, stratify=labels)
-            else:
-                train_idx = []
-                test_idx = []
-                for cls in np.unique(labels):
-                    cls_idx = np.where(labels == cls)[0]
-                    rng.shuffle(cls_idx)
-                    if len(cls_idx) == 1:
-                        train_idx.extend(cls_idx)
-                    else:
-                        n_test = max(1, int(round(len(cls_idx) * test_size)))
-                        n_test = min(n_test, len(cls_idx) - 1)
-                        test_idx.extend(cls_idx[:n_test])
-                        train_idx.extend(cls_idx[n_test:])
-                train_idx = np.array(train_idx)
-                test_idx = np.array(test_idx)
-                rng.shuffle(train_idx)
-                rng.shuffle(test_idx)
+def _subject_of(stem: str) -> str:
+    """'sub-03_ses-1' → '03'."""
+    return stem.split("_")[0].replace("sub-", "")
 
-            train_classes = set(labels[train_idx])
-            test_classes = set(labels[test_idx])
-            for cls, count in class_counts.items():
-                if count >= 2 and (cls not in train_classes or cls not in test_classes):
-                    raise RuntimeError(f"Class {cls} missing after split in {epoch_file.name}")
 
-            all_train_splits.append(epochs[train_idx])
-            all_test_splits.append(epochs[test_idx])
+def _load_task_data(task: str, directory: str):
+    """
+    Load every configured subject's epoch file once and return a list of
+    ``{"subject", "stem", "X", "y"}`` dicts (labels already mapped to task indices).
+    """
+    dir_path = Path(os.getcwd(), "processed", directory)
+    if not dir_path.exists():
+        raise ValueError(f"[DATASET] {dir_path} does not exist. Run create_epochs first.")
 
-    print("-" * 40)
-    print("Concatenating all splits...")
-    global_train_epochs = mne.concatenate_epochs(all_train_splits)
-    global_test_epochs = mne.concatenate_epochs(all_test_splits)
-    
-    # Log any missing classes in train set
-    train_labels = global_train_epochs.events[:, -1]
-    val_labels = global_test_epochs.events[:, -1]
-    train_classes = set(train_labels)
-    val_classes = set(val_labels)
-    missing_in_train = val_classes - train_classes
-    if missing_in_train:
-        print(f"Warning: The following classes are in the validation set but not in the training set: {missing_in_train}")
+    config = load_config()
+    included = set(config["dataset"]["subjects"])
 
-    return global_train_epochs, global_test_epochs
+    vocab = task_vocabulary(task)
+    label_to_idx = {lbl: i for i, lbl in enumerate(vocab)}
+
+    files = sorted(
+        f for f in dir_path.glob("*.fif")
+        if any(f.stem.startswith(f"sub-{s}") for s in included)
+    )
+    log.info(f"[DATASET] task='{task}'  {len(files)} file(s)  {len(vocab)} classes")
+
+    records = []
+    ch_names = None
+    for f in files:
+        epochs = mne.read_epochs(f, preload=True, verbose=False)
+        if ch_names is None:
+            ch_names = epochs.ch_names
+        if epochs.metadata is None:
+            raise ValueError(
+                f"[DATASET] {f.name} has no metadata — it predates the current pipeline. "
+                f"Delete processed/words/ and regenerate with workflow.create_words_epochs=true."
+            )
+        mask, labels = select_labels(epochs.metadata, task)
+        if not mask.any():
+            log.warning(f"[DATASET] {f.stem}: no epochs for task '{task}' — skipped")
+            continue
+
+        X = epochs.get_data()[mask].astype(np.float32)
+        y = np.array([label_to_idx[l] for l in labels], dtype=np.int64)
+        records.append({"subject": _subject_of(f.stem), "stem": f.stem, "X": X, "y": y})
+        log.info(f"[DATASET]   {f.stem}: X={X.shape}  classes_present={len(np.unique(y))}")
+
+    return records, len(vocab), vocab, ch_names
+
+
+def make_loso_folds(task: str, directory: str = "words"):
+    """
+    Yield one LOSO fold per subject:
+
+        (held_out_subject, (X_train, y_train), val_dict, n_classes, vocab, ch_names)
+
+    where ``val_dict`` maps each held-out session stem → ``(X, y)``. Training data
+    pools every *other* subject's epochs.
+    """
+    records, n_classes, vocab, ch_names = _load_task_data(task, directory)
+    subjects = sorted({r["subject"] for r in records})
+    log.info(f"[DATASET] LOSO over {len(subjects)} subject(s): {subjects}")
+
+    for held_out in subjects:
+        train_recs = [r for r in records if r["subject"] != held_out]
+        val_recs = [r for r in records if r["subject"] == held_out]
+
+        X_train = np.concatenate([r["X"] for r in train_recs])
+        y_train = np.concatenate([r["y"] for r in train_recs])
+        val_dict = {r["stem"]: (r["X"], r["y"]) for r in val_recs}
+
+        log.info(
+            f"[DATASET] Fold held_out=sub-{held_out}  "
+            f"train={X_train.shape[0]} epochs from {len(train_recs)} file(s)  "
+            f"val={sum(len(y) for _, y in val_dict.values())} epochs from {len(val_dict)} file(s)"
+        )
+        yield held_out, (X_train, y_train), val_dict, n_classes, vocab, ch_names
